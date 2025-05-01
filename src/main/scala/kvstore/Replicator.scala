@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, Cancellable, Props}
+import akka.actor.{Actor, ActorRef, Props}
 
 import scala.concurrent.duration._
 
@@ -41,13 +41,10 @@ class Replicator(val replica: ActorRef) extends Actor {
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case r@Replicate(key, valueOption, id) =>
-      println(s"received message Replicate:${r} from ${sender()}")
       val seq = nextSeq()
       acks = acks.updated(seq, (sender(), r))
-      val snapshot = Snapshot(key, valueOption, seq)
-      pending = pending :+ snapshot
-    case s@SnapshotAck(key, seq) =>
-      println(s"recieve SnapshotAck:${s}")
+      pending = pending :+ Snapshot(key, valueOption, seq)
+    case SnapshotAck(key, seq) =>
       acks.get(seq).foreach { p =>
         pending = pending.filter(_ != Snapshot(key, p._2.valueOption, seq))
         p._1 ! Replicated(p._2.key, p._2.id)
