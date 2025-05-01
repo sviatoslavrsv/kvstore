@@ -25,7 +25,7 @@ class Replicator(val replica: ActorRef) extends Actor {
    */
 
   // map from sequence number to pair of sender and request
-  var acks = Map.empty[Long, (ActorRef, Replicate, Cancellable)]
+  var acks = Map.empty[Long, (ActorRef, Replicate)]
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
   var pending = Vector.empty[Snapshot]
 
@@ -36,17 +36,20 @@ class Replicator(val replica: ActorRef) extends Actor {
     ret
   }
 
+  context.system.scheduler.scheduleWithFixedDelay(1.millis, 100.millis)(() => pending.foreach(snapshot => replica ! snapshot))
+
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case r@Replicate(key, valueOption, id) =>
       println(s"received message Replicate:${r} from ${sender()}")
       val seq = nextSeq()
-      val cancellable = context.system.scheduler.scheduleWithFixedDelay(0.millis, 100.millis)(() => replica ! Snapshot(key, valueOption, seq))
-      acks = acks.updated(seq, (sender(), r, cancellable))
+      acks = acks.updated(seq, (sender(), r))
+      val snapshot = Snapshot(key, valueOption, seq)
+      pending = pending :+ snapshot
     case s@SnapshotAck(key, seq) =>
       println(s"recieve SnapshotAck:${s}")
       acks.get(seq).foreach { p =>
-        p._3.cancel()
+        pending = pending.filter(_ != Snapshot(key, p._2.valueOption, seq))
         p._1 ! Replicated(p._2.key, p._2.id)
       }
       acks = acks.removed(seq)
