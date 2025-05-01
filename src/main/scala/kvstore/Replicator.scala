@@ -1,15 +1,16 @@
 package kvstore
 
-import akka.actor.Props
-import akka.actor.Actor
-import akka.actor.ActorRef
+import akka.actor.{Actor, ActorRef, Cancellable, Props}
+
 import scala.concurrent.duration._
 
 object Replicator {
   case class Replicate(key: String, valueOption: Option[String], id: Long)
+
   case class Replicated(key: String, id: Long)
 
   case class Snapshot(key: String, valueOption: Option[String], seq: Long)
+
   case class SnapshotAck(key: String, seq: Long)
 
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
@@ -24,7 +25,7 @@ class Replicator(val replica: ActorRef) extends Actor {
    */
 
   // map from sequence number to pair of sender and request
-  var acks = Map.empty[Long, (ActorRef, Replicate)]
+  var acks = Map.empty[Long, (ActorRef, Replicate, Cancellable)]
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
   var pending = Vector.empty[Snapshot]
 
@@ -35,22 +36,20 @@ class Replicator(val replica: ActorRef) extends Actor {
     ret
   }
 
-  context.system.scheduler.scheduleWithFixedDelay(1.millis, 100.millis)(() => pending.foreach(snapshot => replica ! snapshot))
-
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case r@Replicate(key, valueOption, id) =>
       println(s"received message Replicate from ${sender()}")
       val seq = nextSeq()
-      acks = acks.updated(seq, (sender(), r))
-      val snapshot = Snapshot(key, valueOption, seq)
-      pending = pending :+ snapshot
+      val cancellable = context.system.scheduler.scheduleWithFixedDelay(0.millis, 100.millis)(() => replica ! Snapshot(key, valueOption, seq))
+      acks = acks.updated(seq, (sender(), r, cancellable))
     case s@SnapshotAck(key, seq) =>
       println(s"recieve SnapshotAck:${s}")
-      acks.get(seq).map { p =>
-        pending = pending.filter(_ != Snapshot(key, p._2.valueOption, seq))
-        p._1 ! Replicated(key, seq)
+      acks.get(seq).foreach { p =>
+        p._3.cancel()
+        p._1 ! Replicated(p._2.key, p._2.id)
       }
+      acks = acks.removed(seq)
   }
 
 }

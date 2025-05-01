@@ -50,6 +50,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var replicators = Set.empty[ActorRef]
   var persistence: ActorRef = context.system.actorOf(persistenceProps)
   var persistAcks = Map.empty[Long, (ActorRef, Cancellable)]
+  var replicatedAcksInsert = Map.empty[ActorRef, Set[Long]]
+  var replicatedAcksRemove = Map.empty[ActorRef, Set[Long]]
   arbiter ! Join
 
   def receive: Receive = {
@@ -66,24 +68,46 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Insert(key, value, id) =>
       val send = sender()
       kv = kv.updated(key, value)
-      replicators.foreach(_ ! Replicate(key, Some(value), id))
+      replicators.foreach { repl =>
+        replicatedAcksInsert = replicatedAcksInsert.updated(repl, replicatedAcksInsert.get(repl).toSet.flatten + id)
+        repl ! Replicate(key, Some(value), id)
+      }
+      //add primary replica
+      replicatedAcksInsert = replicatedAcksInsert.updated(self, replicatedAcksInsert.get(self).toSet.flatten + id)
       persist(key, Some(value), id, sender())
-      context.system.scheduler.scheduleOnce(1000.millis)(send ! OperationFailed(id))
+      context.system.scheduler.scheduleOnce(1000.millis) {
+        if (replicators.exists(repl => replicatedAcksInsert.get(repl).exists(_.contains(id)))) {
+          send ! OperationFailed(id)
+        } else {
+          send ! OperationAck(id)
+        }
+      }
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case Remove(key, id) =>
       val send = sender()
       kv = kv.removed(key)
-      replicators.foreach(_ ! Replicate(key, None, id))
+      replicators.foreach { repl =>
+        replicatedAcksInsert = replicatedAcksInsert.updated(repl, replicatedAcksInsert.get(repl).toSet.flatten + id)
+        repl ! Replicate(key, None, id)
+      }
+      //add primary replica
+      replicatedAcksInsert = replicatedAcksInsert.updated(self, replicatedAcksInsert.get(self).toSet.flatten + id)
       persist(key, None, id, sender())
-      context.system.scheduler.scheduleOnce(1000.millis)(send ! OperationFailed(id))
-
+      context.system.scheduler.scheduleOnce(1000.millis) {
+        if (replicators.exists(repl => replicatedAcksInsert.get(repl).exists(_.contains(id)))) {
+          send ! OperationFailed(id)
+        } else {
+          send ! OperationAck(id)
+        }
+      }
     case Replicas(allReplicas) =>
       println(allReplicas)
       //remove old
       val torem = secondaries.values.filter(act => !allReplicas.contains(act))
       torem.foreach { actToRem =>
-        println(s"to remove old:${actToRem}")
+        println(s"Primary to remove old:${actToRem}")
+        replicatedAcksInsert = replicatedAcksInsert - actToRem
         secondaries.get(actToRem).foreach { replicator =>
           replicators = replicators - replicator
           replicator ! Kill
@@ -93,28 +117,28 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       } //add new
       val toadd = allReplicas.diff(secondaries.values.toSet).filter(_ != self)
       toadd.foreach { replica =>
-        println(s"new replica:${replica}")
+        println(s"Primary new replica:${replica}")
         context.watch(replica)
         val replicator = context.actorOf(Replicator.props(replica), s"replicator_sec_${replica.hashCode()}")
-        println(s"new replicator:${replicator}")
+        println(s"Primary new replicator:${replicator}")
         replicators = replicators + replicator
         secondaries = secondaries.updated(replica, replicator)
         kv.foreach { case (key, value) => replicator ! Replicate(key, Some(value), 0) }
       }
 
     case Replicated(key, id) =>
-      println("Replicated primary")
+      println(s"Primary Replicated ack for key:$key id:$id")
+      replicatedAcksInsert = replicatedAcksInsert.updatedWith(sender())(_.map(_ - id))
     case p@Persisted(_, id) =>
-      println(s"primary Persisted:${p}")
+      println(s"Primary Persisted:${p}")
+      replicatedAcksInsert = replicatedAcksInsert.updatedWith(self)(_.map(_ - id))
       persistAcks.get(id).foreach {
-        case (sender, cancellable) =>
+        case (_, cancellable) =>
           cancellable.cancel()
-          sender ! OperationAck(id)
           persistAcks = persistAcks.removed(id)
       }
-
     case t@Terminated(actorReplica) =>
-      println(s"actor was Terminated:${t.actor}")
+      println(s"Primary actor was Terminated:${t.actor}")
       secondaries.get(actorReplica).map { replicator =>
         secondaries = secondaries.removed(actorReplica)
         replicators = replicators - replicator
@@ -137,8 +161,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
 
-    case Persisted(key, id) =>
-      println(s"Persisted secondary")
+    case p@Persisted(key, id) =>
+      println(s"Secondary Persisted:${p}")
       persistAcks.get(id).foreach {
         case (sendor, cancellable) =>
           cancellable.cancel()
@@ -150,7 +174,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   private def persist(key: String, valueOption: Option[String], id: Long, sender: ActorRef): Unit = {
     val send = sender
     val pers = persistence
-    val cancellable = context.system.scheduler.scheduleWithFixedDelay(1.millis, 100.millis, pers, Persist(key, valueOption, id))
+    val cancellable = context.system.scheduler.scheduleAtFixedRate(0.millis, 100.millis, pers, Persist(key, valueOption, id))
     persistAcks = persistAcks.updated(id, (send, cancellable))
   }
 }
