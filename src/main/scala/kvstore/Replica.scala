@@ -1,8 +1,7 @@
 package kvstore
 
-import akka.Done
 import akka.actor.SupervisorStrategy.Restart
-import akka.actor.{Actor, ActorRef, Cancellable, Kill, OneForOneStrategy, Props, SupervisorStrategy, Terminated}
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, SupervisorStrategy, Terminated}
 import akka.util.Timeout
 import kvstore.Arbiter._
 import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
@@ -51,7 +50,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var persistence: ActorRef = context.system.actorOf(persistenceProps)
   var persistAcks = Map.empty[Long, (ActorRef, Cancellable)]
   var replicatedAcksInsert = Map.empty[ActorRef, Set[Long]]
-  var replicatedAcksRemove = Map.empty[ActorRef, Set[Long]]
   arbiter ! Join
 
   def receive: Receive = {
@@ -65,7 +63,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
-    case Insert(key, value, id) =>
+    case i@Insert(key, value, id) =>
+      println(s"      INSERT :${i}")
       val send = sender()
       kv = kv.updated(key, value)
       replicators.foreach { repl =>
@@ -76,15 +75,20 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       replicatedAcksInsert = replicatedAcksInsert.updated(self, replicatedAcksInsert.get(self).toSet.flatten + id)
       persist(key, Some(value), id, sender())
       context.system.scheduler.scheduleOnce(1000.millis) {
-        if (replicators.exists(repl => replicatedAcksInsert.get(repl).exists(_.contains(id)))) {
+        val replicasFailedExist = replicators.exists(repl => replicatedAcksInsert.get(repl).exists(_.contains(id)))
+        val primFailExists = replicatedAcksInsert.get(self).exists(_.contains(id))
+        println(s"scheduleOnce for ${i} isFail: ${replicasFailedExist}=${primFailExists}")
+        if (replicasFailedExist || primFailExists) {
           send ! OperationFailed(id)
         } else {
           send ! OperationAck(id)
         }
       }
+      println(s"primary insert@@@@@@@@\n${replicatedAcksInsert.mkString("\n")}\n@@@@@@@@")
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
-    case Remove(key, id) =>
+    case r@Remove(key, id) =>
+      println(s"      REMOVE :${r}")
       val send = sender()
       kv = kv.removed(key)
       replicators.foreach { repl =>
@@ -95,27 +99,33 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       replicatedAcksInsert = replicatedAcksInsert.updated(self, replicatedAcksInsert.get(self).toSet.flatten + id)
       persist(key, None, id, sender())
       context.system.scheduler.scheduleOnce(1000.millis) {
-        if (replicators.exists(repl => replicatedAcksInsert.get(repl).exists(_.contains(id)))) {
+        val replicasFailedExist = replicators.exists(repl => replicatedAcksInsert.get(repl).exists(_.contains(id)))
+        val primFailExists = replicatedAcksInsert.get(self).exists(_.contains(id))
+        println(s"scheduleOnce for ${r} isFail: ${replicasFailedExist}=${primFailExists}")
+        if (replicasFailedExist || primFailExists) {
           send ! OperationFailed(id)
         } else {
           send ! OperationAck(id)
         }
       }
+      println(s"primary remove@@@@@@@@\n${replicatedAcksInsert.mkString("\n")}\n@@@@@@@@")
     case Replicas(allReplicas) =>
-      println(allReplicas)
+      println(s"########## ${allReplicas.mkString("\n")}\n")
       //remove old
-      val torem = secondaries.values.filter(act => !allReplicas.contains(act))
+      val torem = secondaries.keys.filter(act => !allReplicas.contains(act))
+      println(s"will remove:${torem}")
       torem.foreach { actToRem =>
         println(s"Primary to remove old:${actToRem}")
         replicatedAcksInsert = replicatedAcksInsert - actToRem
         secondaries.get(actToRem).foreach { replicator =>
           replicators = replicators - replicator
-          replicator ! Kill
+          context.stop(replicator)
         }
         secondaries = secondaries.removed(actToRem)
-        actToRem ! Kill
+        context.stop(actToRem)
       } //add new
-      val toadd = allReplicas.diff(secondaries.values.toSet).filter(_ != self)
+      val toadd = allReplicas.diff(secondaries.keys.toSet).filter(_ != self)
+      println(s"will add:${toadd}")
       toadd.foreach { replica =>
         println(s"Primary new replica:${replica}")
         context.watch(replica)
@@ -126,8 +136,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         kv.foreach { case (key, value) => replicator ! Replicate(key, Some(value), 0) }
       }
 
-    case Replicated(key, id) =>
-      println(s"Primary Replicated ack for key:$key id:$id")
+    case r@Replicated(key, id) =>
+      println(s"Primary Replicated secondary ack for ${r}")
       replicatedAcksInsert = replicatedAcksInsert.updatedWith(sender())(_.map(_ - id))
     case p@Persisted(_, id) =>
       println(s"Primary Persisted:${p}")
@@ -148,16 +158,22 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   /* TODO Behavior for the replica role. */
   def replica(localSeq: Long): Receive = {
     case s@Snapshot(key, valueOption, seq) =>
-      println(s"Snapshot secondary:${s}")
+      println(s"Secondary Snapshot:${s}")
       if (seq == localSeq) {
         valueOption match {
           case Some(value) => kv = kv.updated(key, value)
           case None => kv = kv.removed(key)
         }
-        context.become(replica(localSeq + 1))
+        println(s"Secondary good seq:${localSeq}==${seq}")
         persist(key, valueOption, seq, sender())
+        context.become(replica(localSeq + 1))
       }
-      if (seq < localSeq) sender() ! SnapshotAck(key, seq)
+      if (seq < localSeq) {
+        println(s"Secondary low seq:${localSeq}>${seq}")
+        sender() ! SnapshotAck(key, seq)
+      } else if (seq > localSeq) {
+        println(s"Secondary bad seq:${localSeq}<${seq}")
+      }
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
 

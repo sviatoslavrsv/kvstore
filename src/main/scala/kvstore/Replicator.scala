@@ -39,7 +39,7 @@ class Replicator(val replica: ActorRef) extends Actor {
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case r@Replicate(key, valueOption, id) =>
-      println(s"received message Replicate from ${sender()}")
+      println(s"received message Replicate:${r} from ${sender()}")
       val seq = nextSeq()
       val cancellable = context.system.scheduler.scheduleWithFixedDelay(0.millis, 100.millis)(() => replica ! Snapshot(key, valueOption, seq))
       acks = acks.updated(seq, (sender(), r, cancellable))
