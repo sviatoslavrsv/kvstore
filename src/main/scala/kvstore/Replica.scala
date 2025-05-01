@@ -126,10 +126,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         }
         persist(key, valueOption, seq, sender())
         context.become(replica(localSeq + 1))
-      }
-      if (seq < localSeq) {
+      } else if (seq < localSeq) {
         sender() ! SnapshotAck(key, seq)
-      } else if (seq > localSeq) {
       }
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
