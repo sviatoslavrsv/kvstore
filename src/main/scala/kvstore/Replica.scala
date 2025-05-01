@@ -1,7 +1,7 @@
 package kvstore
 
 import akka.actor.SupervisorStrategy.Restart
-import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, SupervisorStrategy, Terminated}
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, Props, SupervisorStrategy}
 import kvstore.Arbiter._
 import kvstore.Replicator.{Replicate, Replicated, Snapshot, SnapshotAck}
 
@@ -99,7 +99,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       } //add new
       val toadd = allReplicas.diff(secondaries.keys.toSet).filter(_ != self)
       toadd.foreach { replica =>
-        context.watch(replica)
         val replicator = context.actorOf(Replicator.props(replica), s"replicator_sec_${replica.hashCode()}")
         replicators = replicators + replicator
         secondaries = secondaries.updated(replica, replicator)
@@ -114,11 +113,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         case (_, cancellable) =>
           cancellable.cancel()
           persistAcks = persistAcks.removed(id)
-      }
-    case Terminated(actorReplica) =>
-      secondaries.get(actorReplica).map { replicator =>
-        secondaries = secondaries.removed(actorReplica)
-        replicators = replicators - replicator
       }
   }
 
