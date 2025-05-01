@@ -40,11 +40,13 @@ class Replicator(val replica: ActorRef) extends Actor {
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
     case r@Replicate(key, valueOption, id) =>
+      println(s"received message Replicate from ${sender()}")
       val seq = nextSeq()
       acks = acks.updated(seq, (sender(), r))
       val snapshot = Snapshot(key, valueOption, seq)
       pending = pending :+ snapshot
-    case SnapshotAck(key, seq) =>
+    case s@SnapshotAck(key, seq) =>
+      println(s"recieve SnapshotAck:${s}")
       acks.get(seq).map { p =>
         pending = pending.filter(_ != Snapshot(key, p._2.valueOption, seq))
         p._1 ! Replicated(key, seq)
